@@ -1,9 +1,9 @@
 # 简要介绍
-将 Google Drive （谷歌云盘）的文件传输到 Jbox（交大云盘）。避免直链下载浪费流量
+将 Google Drive （谷歌云盘）的文件传输到 Jbox（交大云盘）。避免直链下载浪费流量。已有学长/学姐做过类似工具https://github.com/1357310795/TboxWebdav
 
 # 简要使用方法
-==前提：务必先要挂载 Google Drive，Make sure to mount Google Drive first.==
-==请正确获取Jaccount的token==
+**前提：务必先要挂载 Google Drive，Make sure to mount Google Drive first**
+**请正确获取Jaccount的token**
 将文件放在正确位置
 
 两个文件都同级位于 Google Drive `/content/drive/MyDrive/Colab Notebooks/`：

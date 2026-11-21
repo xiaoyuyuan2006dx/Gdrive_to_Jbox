@@ -34,6 +34,7 @@
 ---
 
 ## 快速开始：获取交大云盘凭证
+可以参考https://github.com/1357310795/TboxWebdav 的README.md
 
 支持两种认证方式，任选其一即可：
 
