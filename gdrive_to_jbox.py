@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Reusable Google Drive (Colab mount) -> SJTU Jbox (pan.sjtu.edu.cn) uploader.
+"""Optimized Google Drive (Colab mount) -> SJTU Jbox (pan.sjtu.edu.cn) uploader (v2).
 
-Supports single-archive packaging (uncompressed .zip or .tar), per-subdirectory
-independent packaging, or direct file tree syncing, with 4 MiB chunk-level
-resumable uploads directly against the SJTU pan / Tencent SMH native API.
+Enhancements over gdrive_to_jbox.py:
+1. Parallel single-pass directory scan via os.scandir() with cached stat metadata
+   (eliminates duplicate FUSE tree walks and per-file os.stat() during packing).
+2. Multi-threaded bounded-memory prefetch archiving (12 Drive reader threads by default)
+   with automatic streaming fallback for oversized files.
+3. 1-ahead pack/upload pipeline overlap in `subdir` mode.
 """
 
 from __future__ import annotations
@@ -11,16 +14,19 @@ from __future__ import annotations
 import argparse
 import getpass
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tarfile
 import threading
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, quote, urlparse
@@ -32,6 +38,9 @@ from tqdm.auto import tqdm
 DEFAULT_BASE_URL = "https://pan.sjtu.edu.cn"
 DEFAULT_WORK_DIR = "/content/.jbox_transfer"
 DEFAULT_CHUNK_MB = 4
+DEFAULT_PACK_WORKERS = 12
+DEFAULT_PREFETCH_MB = 128
+PREFETCH_MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_PARTS_PER_WAVE = 50
 MAX_CHUNKS_PER_FILE = 10000
 COPY_BUF_SIZE = 1024 * 1024  # 1 MiB
@@ -1052,45 +1061,76 @@ class ResumableUploader:
         raise JboxTransferError(f"上传失败（会话重试次数耗尽）: {norm_remote}")
 
 
-def scan_tree(root_dir: str) -> dict[str, Any]:
-    """Walk a directory tree deterministically and collect files, directories, and stats."""
+def _scan_one_dir(
+    dir_path: str, rel_posix: str
+) -> tuple[
+    list[tuple[str, str, int, int]],
+    list[tuple[str, str, int, int, int]],
+    int,
+    int,
+]:
+    """Scan a single directory via os.scandir() and return cached stat entries."""
+    sub_dirs: list[tuple[str, str, int, int]] = []
+    sub_files: list[tuple[str, str, int, int, int]] = []
+    local_bytes = 0
+    local_max_mtime = 0
+
+    with os.scandir(dir_path) as it:
+        for entry in it:
+            if entry.is_symlink():
+                continue
+            name = entry.name
+            rel = f"{rel_posix}/{name}" if rel_posix else name
+            st = entry.stat(follow_symlinks=False)
+            if st.st_mtime_ns > local_max_mtime:
+                local_max_mtime = st.st_mtime_ns
+            if stat.S_ISDIR(st.st_mode):
+                sub_dirs.append((entry.path, rel, st.st_mtime_ns, st.st_mode))
+            elif stat.S_ISREG(st.st_mode):
+                sub_files.append((entry.path, rel, st.st_size, st.st_mtime_ns, st.st_mode))
+                local_bytes += st.st_size
+
+    return sub_dirs, sub_files, local_bytes, local_max_mtime
+
+
+def scan_tree(root_dir: str, scan_workers: int = 8) -> dict[str, Any]:
+    """Walk a directory tree concurrently via os.scandir() and cache all stat metadata."""
     abs_root = os.path.abspath(root_dir)
     if not os.path.isdir(abs_root):
         raise NotADirectoryError(f"不是有效目录: {abs_root}")
 
-    files: list[tuple[str, str, int, int]] = []
-    dirs: list[tuple[str, str]] = []
+    root_st = os.stat(abs_root)
+    dirs: list[tuple[str, str, int, int]] = []
+    files: list[tuple[str, str, int, int, int]] = []
     total_bytes = 0
     max_mtime_ns = 0
 
-    for current, dirnames, filenames in os.walk(abs_root, followlinks=False):
-        dirnames.sort()
-        filenames.sort()
-        rel_dir = os.path.relpath(current, abs_root)
-        rel_dir_posix = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
+    max_w = max(1, min(int(scan_workers), 16))
+    frontier: list[tuple[str, str]] = [(abs_root, "")]
 
-        for dname in dirnames:
-            dpath = os.path.join(current, dname)
-            if os.path.islink(dpath):
-                continue
-            d_rel = f"{rel_dir_posix}/{dname}" if rel_dir_posix else dname
-            dirs.append((dpath, d_rel))
-            st = os.stat(dpath)
-            if st.st_mtime_ns > max_mtime_ns:
-                max_mtime_ns = st.st_mtime_ns
+    with ThreadPoolExecutor(max_workers=max_w) as pool:
+        while frontier:
+            if len(frontier) == 1 or max_w == 1:
+                results = [_scan_one_dir(dpath, rpos) for dpath, rpos in frontier]
+            else:
+                futures = [pool.submit(_scan_one_dir, dpath, rpos) for dpath, rpos in frontier]
+                results = [fut.result() for fut in futures]
 
-        for fname in filenames:
-            fpath = os.path.join(current, fname)
-            if os.path.islink(fpath):
-                continue
-            f_rel = f"{rel_dir_posix}/{fname}" if rel_dir_posix else fname
-            st = os.stat(fpath)
-            files.append((fpath, f_rel, st.st_size, st.st_mtime_ns))
-            total_bytes += st.st_size
-            if st.st_mtime_ns > max_mtime_ns:
-                max_mtime_ns = st.st_mtime_ns
+            next_frontier: list[tuple[str, str]] = []
+            for sub_dirs, sub_files, local_bytes, local_max_mtime in results:
+                dirs.extend(sub_dirs)
+                files.extend(sub_files)
+                total_bytes += local_bytes
+                if local_max_mtime > max_mtime_ns:
+                    max_mtime_ns = local_max_mtime
+                for dpath, rel, _, _ in sub_dirs:
+                    next_frontier.append((dpath, rel))
+            frontier = next_frontier
 
+    dirs.sort(key=lambda item: item[1])
+    files.sort(key=lambda item: item[1])
     return {
+        "root_meta": (abs_root, root_st.st_mtime_ns, root_st.st_mode),
         "dirs": dirs,
         "files": files,
         "file_count": len(files),
@@ -1110,26 +1150,56 @@ def ensure_free_disk(work_dir: str, total_source_bytes: int) -> None:
         )
 
 
-def _make_zip_info(full_path: str, arcname: str) -> zipfile.ZipInfo:
-    """Create a ZipInfo with safe ZIP_STORED and pre-1980 timestamp fallback."""
-    try:
-        zinfo = zipfile.ZipInfo.from_file(full_path, arcname)
-    except ValueError:
-        st = os.stat(full_path)
-        if os.path.isdir(full_path) and not arcname.endswith("/"):
-            arcname = arcname + "/"
-        zinfo = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
-        if os.path.isdir(full_path):
-            zinfo.external_attr = (0o40755 << 16) | 0x10
-        else:
-            zinfo.external_attr = (st.st_mode & 0xFFFF) << 16
-            zinfo.file_size = st.st_size
+def _make_zip_info_from_meta(
+    arcname: str,
+    size: int,
+    mtime_ns: int,
+    mode: int,
+    is_dir: bool,
+) -> zipfile.ZipInfo:
+    """Build ZipInfo from cached stat metadata without triggering another FUSE os.stat()."""
+    if is_dir and not arcname.endswith("/"):
+        arcname = arcname + "/"
+    tm = time.localtime(mtime_ns / 1_000_000_000)
+    if tm.tm_year < 1980:
+        date_time = (1980, 1, 1, 0, 0, 0)
+    else:
+        date_time = (tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+    zinfo = zipfile.ZipInfo(arcname, date_time=date_time)
+    if is_dir:
+        zinfo.external_attr = ((mode & 0xFFFF) << 16) | 0x10
+        zinfo.file_size = 0
+    else:
+        zinfo.external_attr = (mode & 0xFFFF) << 16
+        zinfo.file_size = size
     zinfo.compress_type = zipfile.ZIP_STORED
     return zinfo
 
 
+def _make_tar_info_from_meta(
+    arcname: str,
+    size: int,
+    mtime_ns: int,
+    mode: int,
+    is_dir: bool,
+) -> tarfile.TarInfo:
+    """Build TarInfo from cached stat metadata without triggering another FUSE os.stat()."""
+    tinfo = tarfile.TarInfo(name=arcname)
+    tinfo.mtime = int(mtime_ns // 1_000_000_000)
+    tinfo.mode = stat.S_IMODE(mode)
+    tinfo.type = tarfile.DIRTYPE if is_dir else tarfile.REGTYPE
+    tinfo.size = 0 if is_dir else size
+    return tinfo
+
+
+def _read_file_bytes(path: str) -> bytes:
+    """Read an entire file into memory for bounded prefetch archiving."""
+    with open(path, "rb") as f:
+        return f.read()
+
+
 class _ProgressFileReader:
-    """Wrap a binary file stream to advance a tqdm progress bar during tarfile archiving."""
+    """Wrap a binary file stream to advance a tqdm progress bar during tarfile streaming."""
 
     def __init__(self, raw_file: Any, pbar: tqdm) -> None:
         self._raw = raw_file
@@ -1149,8 +1219,13 @@ def build_or_reuse_archive(
     archive_format: str = "zip",
     force_repack: bool = False,
     arc_root_name: Optional[str] = None,
+    pre_scanned_tree: Optional[dict[str, Any]] = None,
+    pack_workers: int = DEFAULT_PACK_WORKERS,
+    prefetch_mb: int = DEFAULT_PREFETCH_MB,
+    prefetch_max_file_bytes: int = PREFETCH_MAX_FILE_BYTES,
+    show_progress: bool = True,
 ) -> tuple[str, int, bool]:
-    """Build an uncompressed .zip or .tar archive atomically, or reuse an up-to-date local copy."""
+    """Build an uncompressed .zip or .tar archive using parallel prefetch, or reuse cached."""
     if archive_format not in {"zip", "tar"}:
         raise ValueError(f"不支持的 archive_format: {archive_format!r}")
 
@@ -1160,7 +1235,7 @@ def build_or_reuse_archive(
     archive_path = os.path.join(archive_dir, archive_name)
     meta_path = os.path.join(archive_dir, f"{archive_name}.pack_meta.json")
 
-    tree = scan_tree(abs_src)
+    tree = pre_scanned_tree if pre_scanned_tree is not None else scan_tree(abs_src, scan_workers=pack_workers)
     src_count = tree["file_count"]
     src_bytes = tree["total_bytes"]
     src_max_mtime = tree["max_mtime_ns"]
@@ -1189,50 +1264,137 @@ def build_or_reuse_archive(
 
     os.makedirs(archive_dir, exist_ok=True)
     ensure_free_disk(archive_dir, src_bytes)
-    tmp_path = f"{archive_path}.tmp.{os.getpid()}"
+    tmp_path = f"{archive_path}.tmp.{os.getpid()}.{threading.get_ident()}"
     if os.path.exists(tmp_path):
         os.remove(tmp_path)
 
+    if "root_meta" in tree:
+        _, root_mtime_ns, root_mode = tree["root_meta"]
+    else:
+        root_st = os.stat(abs_src)
+        root_mtime_ns, root_mode = root_st.st_mtime_ns, root_st.st_mode
+
+    files = tree["files"]
+    dirs = tree["dirs"]
+    p_workers = max(1, int(pack_workers))
+    budget_bytes = max(1, int(prefetch_mb)) * 1024 * 1024
+    max_file_prefetch = min(int(prefetch_max_file_bytes), max(1, budget_bytes // 2))
+    max_inflight_files = max(p_workers * 3, 24)
+
     print(
-        f"📦 正在无压缩打包 {archive_name} ({src_count} 个文件, {format_bytes(src_bytes)})..."
+        f"📦 正在无压缩打包 {archive_name} ({src_count} 个文件, {format_bytes(src_bytes)}, "
+        f"预读线程={p_workers}, 缓冲={prefetch_mb} MiB)..."
     )
+    t0 = time.monotonic()
     pbar = tqdm(
         total=src_bytes,
         unit="B",
         unit_scale=True,
         unit_divisor=1024,
         desc=f"📦 {archive_name}",
+        disable=not show_progress,
     )
+
+    pending: deque[tuple[tuple[str, str, int, int, int], Optional[Future[bytes]], int]] = deque()
+    inflight_bytes = 0
+    next_idx = 0
+
+    def _write_entries(writer_cb: Callable[[tuple[str, str, int, int, int], Optional[bytes]], None]) -> None:
+        nonlocal inflight_bytes, next_idx
+        if p_workers <= 1 or len(files) == 0:
+            for entry in files:
+                writer_cb(entry, None)
+            return
+
+        with ThreadPoolExecutor(max_workers=p_workers) as pool:
+            def _submit_more() -> None:
+                nonlocal inflight_bytes, next_idx
+                while next_idx < len(files) and len(pending) < max_inflight_files:
+                    entry = files[next_idx]
+                    fpath, _, fsize, _, _ = entry
+                    if fsize <= max_file_prefetch:
+                        if not pending or (inflight_bytes + fsize <= budget_bytes):
+                            fut = pool.submit(_read_file_bytes, fpath)
+                            pending.append((entry, fut, fsize))
+                            inflight_bytes += fsize
+                            next_idx += 1
+                        else:
+                            break
+                    else:
+                        pending.append((entry, None, 0))
+                        next_idx += 1
+
+            try:
+                _submit_more()
+                while pending:
+                    entry, fut, reserved = pending.popleft()
+                    if fut is not None:
+                        data = fut.result()
+                        inflight_bytes -= reserved
+                        writer_cb(entry, data)
+                        del data
+                    else:
+                        writer_cb(entry, None)
+                    _submit_more()
+            except Exception:
+                for _, fut, _ in pending:
+                    if fut is not None:
+                        fut.cancel()
+                raise
+
     try:
         if archive_format == "zip":
             with zipfile.ZipFile(
                 tmp_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True
             ) as zf:
-                root_zi = _make_zip_info(abs_src, root_name + "/")
-                zf.writestr(root_zi, b"")
-                for dpath, d_rel in tree["dirs"]:
-                    d_zi = _make_zip_info(dpath, f"{root_name}/{d_rel}/")
-                    zf.writestr(d_zi, b"")
-                for fpath, f_rel, fsize, _ in tree["files"]:
-                    f_zi = _make_zip_info(fpath, f"{root_name}/{f_rel}")
-                    with zf.open(f_zi, "w", force_zip64=(fsize >= 0xFFFFFFFF)) as dst, open(
-                        fpath, "rb"
-                    ) as src:
-                        while True:
-                            buf = src.read(COPY_BUF_SIZE)
-                            if not buf:
-                                break
-                            dst.write(buf)
-                            pbar.update(len(buf))
+                zf.writestr(_make_zip_info_from_meta(root_name + "/", 0, root_mtime_ns, root_mode, True), b"")
+                for _, d_rel, d_mtime_ns, d_mode in dirs:
+                    zf.writestr(
+                        _make_zip_info_from_meta(f"{root_name}/{d_rel}/", 0, d_mtime_ns, d_mode, True),
+                        b"",
+                    )
+
+                def _write_zip_entry(entry: tuple[str, str, int, int, int], data: Optional[bytes]) -> None:
+                    fpath, f_rel, fsize, f_mtime_ns, f_mode = entry
+                    arcname = f"{root_name}/{f_rel}"
+                    if data is not None:
+                        f_zi = _make_zip_info_from_meta(arcname, len(data), f_mtime_ns, f_mode, False)
+                        zf.writestr(f_zi, data)
+                        pbar.update(len(data))
+                    else:
+                        f_zi = _make_zip_info_from_meta(arcname, fsize, f_mtime_ns, f_mode, False)
+                        with zf.open(f_zi, "w", force_zip64=(fsize >= 0xFFFFFFFF)) as dst, open(
+                            fpath, "rb"
+                        ) as src:
+                            while True:
+                                buf = src.read(COPY_BUF_SIZE)
+                                if not buf:
+                                    break
+                                dst.write(buf)
+                                pbar.update(len(buf))
+
+                _write_entries(_write_zip_entry)
         else:
             with tarfile.open(tmp_path, "w", format=tarfile.PAX_FORMAT) as tf:
-                tf.add(abs_src, arcname=root_name, recursive=False)
-                for dpath, d_rel in tree["dirs"]:
-                    tf.add(dpath, arcname=f"{root_name}/{d_rel}", recursive=False)
-                for fpath, f_rel, _, _ in tree["files"]:
-                    tinfo = tf.gettarinfo(fpath, arcname=f"{root_name}/{f_rel}")
-                    with open(fpath, "rb") as src:
-                        tf.addfile(tinfo, fileobj=_ProgressFileReader(src, pbar))
+                tf.addfile(_make_tar_info_from_meta(root_name, 0, root_mtime_ns, root_mode, True))
+                for _, d_rel, d_mtime_ns, d_mode in dirs:
+                    tf.addfile(
+                        _make_tar_info_from_meta(f"{root_name}/{d_rel}", 0, d_mtime_ns, d_mode, True)
+                    )
+
+                def _write_tar_entry(entry: tuple[str, str, int, int, int], data: Optional[bytes]) -> None:
+                    fpath, f_rel, fsize, f_mtime_ns, f_mode = entry
+                    arcname = f"{root_name}/{f_rel}"
+                    if data is not None:
+                        tinfo = _make_tar_info_from_meta(arcname, len(data), f_mtime_ns, f_mode, False)
+                        tf.addfile(tinfo, fileobj=io.BytesIO(data))
+                        pbar.update(len(data))
+                    else:
+                        tinfo = _make_tar_info_from_meta(arcname, fsize, f_mtime_ns, f_mode, False)
+                        with open(fpath, "rb") as src:
+                            tf.addfile(tinfo, fileobj=_ProgressFileReader(src, pbar))
+
+                _write_entries(_write_tar_entry)
 
         os.replace(tmp_path, archive_path)
         st_arc = os.stat(archive_path)
@@ -1250,7 +1412,12 @@ def build_or_reuse_archive(
                 "archive_mtime_ns": st_arc.st_mtime_ns,
             },
         )
-        print(f"📦 打包完成: {archive_name} ({format_bytes(st_arc.st_size)})")
+        dt = max(time.monotonic() - t0, 1e-6)
+        avg_mib_s = (st_arc.st_size / (1024 * 1024)) / dt
+        print(
+            f"📦 打包完成: {archive_name} ({format_bytes(st_arc.st_size)}, "
+            f"耗时 {dt:.1f}s, 均速 {avg_mib_s:.2f} MiB/s)"
+        )
         return archive_path, st_arc.st_size, False
     except Exception:
         if os.path.exists(tmp_path):
@@ -1319,8 +1486,9 @@ def _plan_transfer(
     norm_remote_dir: str,
     pack_mode: str,
     archive_format: str,
+    scan_workers: int = DEFAULT_PACK_WORKERS,
 ) -> dict[str, Any]:
-    """Compute upload plan and estimated total bytes without creating archives or hitting network."""
+    """Compute upload plan and estimated total bytes in a single tree pass."""
     base_name = os.path.basename(abs_src.rstrip("/"))
     if os.path.isfile(abs_src):
         st = os.stat(abs_src)
@@ -1342,7 +1510,7 @@ def _plan_transfer(
         }
 
     if pack_mode == "single":
-        tree = scan_tree(abs_src)
+        tree = scan_tree(abs_src, scan_workers=scan_workers)
         archive_name = f"{base_name}.{archive_format}"
         return {
             "is_file": False,
@@ -1358,6 +1526,7 @@ def _plan_transfer(
                     "remote_path": join_remote_path(norm_remote_dir, archive_name),
                     "est_bytes": tree["total_bytes"],
                     "file_count": tree["file_count"],
+                    "tree": tree,
                 }
             ],
         }
@@ -1373,7 +1542,7 @@ def _plan_transfer(
             if os.path.islink(epath):
                 continue
             if os.path.isdir(epath):
-                subtree = scan_tree(epath)
+                subtree = scan_tree(epath, scan_workers=scan_workers)
                 items.append(
                     {
                         "kind": "archive_dir",
@@ -1383,6 +1552,7 @@ def _plan_transfer(
                         "remote_path": join_remote_path(target_root, f"{entry}.{archive_format}"),
                         "est_bytes": subtree["total_bytes"],
                         "file_count": subtree["file_count"],
+                        "tree": subtree,
                     }
                 )
                 total_bytes += subtree["total_bytes"]
@@ -1410,7 +1580,7 @@ def _plan_transfer(
         }
 
     # pack_mode == "direct"
-    tree = scan_tree(abs_src)
+    tree = scan_tree(abs_src, scan_workers=scan_workers)
     items = [
         {
             "kind": "file",
@@ -1419,9 +1589,11 @@ def _plan_transfer(
             "est_bytes": fsize,
             "file_count": 1,
         }
-        for fpath, f_rel, fsize, _ in tree["files"]
+        for fpath, f_rel, fsize, _, _ in tree["files"]
     ]
-    remote_dirs = [target_root] + [join_remote_path(target_root, d_rel) for _, d_rel in tree["dirs"]]
+    remote_dirs = [target_root] + [
+        join_remote_path(target_root, d_rel) for _, d_rel, _, _ in tree["dirs"]
+    ]
     return {
         "is_file": False,
         "base_name": base_name,
@@ -1472,8 +1644,12 @@ def transfer(
     base_url: str = DEFAULT_BASE_URL,
     cos_scheme: str = "https",
     chunk_bytes: Optional[int] = None,
+    pack_workers: int = DEFAULT_PACK_WORKERS,
+    prefetch_mb: int = DEFAULT_PREFETCH_MB,
+    pipeline: bool = True,
+    prefetch_max_file_bytes: int = PREFETCH_MAX_FILE_BYTES,
 ) -> dict[str, Any]:
-    """Package and upload a Google Drive / local path to SJTU Jbox with resumable chunking."""
+    """Package and upload a Google Drive / local path to SJTU Jbox with parallel prefetch & resume."""
     if not src_path or not os.path.exists(src_path):
         raise FileNotFoundError(f"找不到源路径: {src_path}")
     if pack_mode not in {"single", "subdir", "direct"}:
@@ -1482,17 +1658,24 @@ def transfer(
         raise ValueError(f"不支持的 archive_format: {archive_format!r}（可选 zip / tar）")
     if conflict not in {"overwrite", "rename", "ask"}:
         raise ValueError(f"不支持的 conflict 策略: {conflict!r}（可选 overwrite / rename / ask）")
-    if int(workers) < 1 or int(chunk_mb) < 1:
-        raise ValueError("workers 与 chunk_mb 必须 >= 1")
+    if int(workers) < 1 or int(chunk_mb) < 1 or int(pack_workers) < 1 or int(prefetch_mb) < 1:
+        raise ValueError("workers, chunk_mb, pack_workers 与 prefetch_mb 必须 >= 1")
 
+    t_start = time.monotonic()
     norm_auth = normalize_auth_mode(auth_mode)
     abs_src = os.path.abspath(src_path)
     norm_remote_dir = normalize_remote_path(remote_dir)
-    plan = _plan_transfer(abs_src, norm_remote_dir, pack_mode, archive_format)
+
+    t_scan = time.monotonic()
+    plan = _plan_transfer(
+        abs_src, norm_remote_dir, pack_mode, archive_format, scan_workers=int(pack_workers)
+    )
+    scan_dt = time.monotonic() - t_scan
 
     print(
         f"📋 传输计划：源={abs_src} | 模式={pack_mode} | 格式={archive_format} | "
-        f"目标={norm_remote_dir} | 原始文件={plan['total_files']} 个 ({format_bytes(plan['total_bytes'])})"
+        f"目标={norm_remote_dir} | 原始文件={plan['total_files']} 个 ({format_bytes(plan['total_bytes'])}) "
+        f"[扫描 {scan_dt:.2f}s]"
     )
 
     if dry_run:
@@ -1560,39 +1743,90 @@ def transfer(
         else os.path.join(work_dir, "archives")
     )
 
-    for idx, item in enumerate(plan["items"], 1):
-        print(f"\n--- [{idx}/{len(plan['items'])}] 目标: {item['remote_path']} ---")
-        if item["kind"] == "archive_dir":
-            arc_path, _, _ = build_or_reuse_archive(
-                src_dir=item["local_dir"],
-                archive_base_name=item["archive_base"],
+    archive_item_count = sum(1 for item in plan["items"] if item["kind"] == "archive_dir")
+    use_pipeline = pack_mode == "subdir" and bool(pipeline) and archive_item_count >= 2
+    pack_pool = ThreadPoolExecutor(max_workers=1) if use_pipeline else None
+    bg_futures: dict[int, Future[tuple[str, int, bool]]] = {}
+
+    def _schedule_next_subdir_pack(after_idx: int) -> None:
+        if pack_pool is None or bg_futures:
+            return
+        for j in range(after_idx + 1, len(plan["items"])):
+            nxt = plan["items"][j]
+            if nxt["kind"] != "archive_dir":
+                continue
+            nxt_name = f"{nxt['archive_base']}.{archive_format}"
+            print(f"🔄 [后台预打包] 启动下一项: {nxt_name}")
+            bg_futures[j] = pack_pool.submit(
+                build_or_reuse_archive,
+                src_dir=nxt["local_dir"],
+                archive_base_name=nxt["archive_base"],
                 archive_dir=archive_root,
                 archive_format=archive_format,
                 force_repack=force_repack,
-                arc_root_name=item["arc_root_name"],
+                arc_root_name=nxt["arc_root_name"],
+                pre_scanned_tree=nxt.get("tree"),
+                pack_workers=int(pack_workers),
+                prefetch_mb=int(prefetch_mb),
+                prefetch_max_file_bytes=int(prefetch_max_file_bytes),
+                show_progress=False,
             )
-            res = uploader.upload_file(
-                arc_path, item["remote_path"], label=os.path.basename(item["remote_path"])
-            )
-            if not keep_temp:
-                _cleanup_archive_files(arc_path)
-        else:
-            res = uploader.upload_file(
-                item["local_path"],
-                item["remote_path"],
-                label=os.path.basename(item["remote_path"]),
-            )
+            return
 
-        results.append(res)
-        transferred_bytes += res["size"]
-        if res["skipped"]:
-            skipped_count += 1
-        else:
-            uploaded_count += 1
+    try:
+        for idx, item in enumerate(plan["items"]):
+            print(f"\n--- [{idx + 1}/{len(plan['items'])}] 目标: {item['remote_path']} ---")
+            if item["kind"] == "archive_dir":
+                if idx in bg_futures:
+                    fut = bg_futures.pop(idx)
+                    if not fut.done():
+                        print(f"⏳ 等待后台预打包完成: {os.path.basename(item['remote_path'])}")
+                    arc_path, _, _ = fut.result()
+                else:
+                    arc_path, _, _ = build_or_reuse_archive(
+                        src_dir=item["local_dir"],
+                        archive_base_name=item["archive_base"],
+                        archive_dir=archive_root,
+                        archive_format=archive_format,
+                        force_repack=force_repack,
+                        arc_root_name=item["arc_root_name"],
+                        pre_scanned_tree=item.get("tree"),
+                        pack_workers=int(pack_workers),
+                        prefetch_mb=int(prefetch_mb),
+                        prefetch_max_file_bytes=int(prefetch_max_file_bytes),
+                        show_progress=True,
+                    )
 
+                _schedule_next_subdir_pack(idx)
+                res = uploader.upload_file(
+                    arc_path, item["remote_path"], label=os.path.basename(item["remote_path"])
+                )
+                if not keep_temp:
+                    _cleanup_archive_files(arc_path)
+            else:
+                _schedule_next_subdir_pack(idx)
+                res = uploader.upload_file(
+                    item["local_path"],
+                    item["remote_path"],
+                    label=os.path.basename(item["remote_path"]),
+                )
+
+            results.append(res)
+            transferred_bytes += res["size"]
+            if res["skipped"]:
+                skipped_count += 1
+            else:
+                uploaded_count += 1
+    finally:
+        if pack_pool is not None:
+            for fut in bg_futures.values():
+                fut.cancel()
+            pack_pool.shutdown(wait=True, cancel_futures=True)
+
+    total_dt = time.monotonic() - t_start
     print(
         f"\n🎉 全部处理完成！新传 {uploaded_count} 项，跳过 {skipped_count} 项，"
-        f"合计 {format_bytes(transferred_bytes)} -> 交大云盘 {norm_remote_dir}"
+        f"合计 {format_bytes(transferred_bytes)} -> 交大云盘 {norm_remote_dir} (总耗时 {total_dt:.1f}s)"
     )
     return {
         "dry_run": False,
@@ -1604,9 +1838,9 @@ def transfer(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Create CLI argument parser for gdrive_to_jbox."""
+    """Create CLI argument parser for gdrive_to_jbox_v2."""
     parser = argparse.ArgumentParser(
-        description="Google Drive (Colab mount) -> SJTU Jbox (pan.sjtu.edu.cn) 原生分片断点续传工具"
+        description="Google Drive (Colab mount) -> SJTU Jbox (pan.sjtu.edu.cn) 并发预读打包 + 原生分片断点续传工具 (v2)"
     )
     parser.add_argument("--src", required=True, help="本地或 Google Drive 源路径（文件或目录）")
     parser.add_argument("--remote-dir", default="/colab_transfer", help="交大云盘目标目录 (默认: /colab_transfer)")
@@ -1632,6 +1866,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ja-cookie", default=None, help="直接传入 JAAuthCookie（也可通过 JBOX_JA_COOKIE 环境变量）")
     parser.add_argument("--workers", type=int, default=4, help="并发上传分片线程数 (默认: 4)")
     parser.add_argument("--chunk-mb", type=int, default=DEFAULT_CHUNK_MB, help="分片大小 MiB (默认: 4)")
+    parser.add_argument(
+        "--pack-workers",
+        type=int,
+        default=DEFAULT_PACK_WORKERS,
+        help=f"打包阶段并发从 Drive 预读文件的线程数 (默认: {DEFAULT_PACK_WORKERS})",
+    )
+    parser.add_argument(
+        "--prefetch-mb",
+        type=int,
+        default=DEFAULT_PREFETCH_MB,
+        help=f"打包预读内存缓冲上限 MiB (默认: {DEFAULT_PREFETCH_MB})",
+    )
+    parser.add_argument(
+        "--no-pipeline",
+        action="store_true",
+        help="关闭 subdir 模式下「边上传边后台打包下一子目录」流水线",
+    )
     parser.add_argument(
         "--conflict",
         choices=("overwrite", "rename", "ask"),
@@ -1675,6 +1926,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             keep_temp=args.keep_temp,
             speedtest=args.speedtest,
             dry_run=args.dry_run,
+            pack_workers=args.pack_workers,
+            prefetch_mb=args.prefetch_mb,
+            pipeline=not args.no_pipeline,
         )
         return 0
     except KeyboardInterrupt:
