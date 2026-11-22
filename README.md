@@ -24,3 +24,7 @@ REMOTE_DIR = "/colab_transfer" #@param {type:"string"}
 ```
 运行第三个代码块：
 运行然后交互式填写token即可
+
+---
+
+> 2026.11.22 ipynb v2。修改了py打包逻辑为多线程，提升打包速率
