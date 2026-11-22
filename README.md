@@ -3,9 +3,12 @@
 
 # 简要使用方法
 **前提：务必先要挂载 Google Drive，Make sure to mount Google Drive first**
-**请正确获取Jaccount的token**
-将文件放在正确位置
 
+**请正确获取Jaccount的token**
+
+> 具体使用可见 README_gdrive_to_jbox.md
+
+将文件放在正确位置
 两个文件都同级位于 Google Drive `/content/drive/MyDrive/Colab Notebooks/`：
 
 | 文件 | 用途 |
