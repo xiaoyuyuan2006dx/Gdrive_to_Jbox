@@ -6,7 +6,7 @@
 
 **请正确获取Jaccount的token**
 
-> 具体使用可见 README_gdrive_to_jbox.md
+> 具体使用可见  [详细使用说明（README_gdrive_to_jbox.md）](./README_gdrive_to_jbox.md)
 
 将文件放在正确位置
 两个文件都同级位于 Google Drive `/content/drive/MyDrive/Colab Notebooks/`：
