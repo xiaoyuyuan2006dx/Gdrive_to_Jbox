@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Optimized Google Drive (Colab mount) -> SJTU Jbox (pan.sjtu.edu.cn) uploader (v2).
+"""High-throughput Google Drive (Colab mount) -> SJTU Jbox (pan.sjtu.edu.cn) uploader (v3).
 
-Enhancements over gdrive_to_jbox.py:
-1. Parallel single-pass directory scan via os.scandir() with cached stat metadata
-   (eliminates duplicate FUSE tree walks and per-file os.stat() during packing).
-2. Multi-threaded bounded-memory prefetch archiving (12 Drive reader threads by default)
-   with automatic streaming fallback for oversized files.
-3. 1-ahead pack/upload pipeline overlap in `subdir` mode.
+Enhancements in v3 (on top of v2 parallel scan & prefetch archiving):
+1. Persistent worker pool per file upload (eliminates per-50-part wave barriers
+   and preserves thread-local HTTPS Keep-Alive connections across the entire file).
+2. Sliding-window background part pre-signing (pre-renews the next 50 parts while
+   current parts are still uploading, plus single-flight on-demand refresh).
+3. Throttled checkpoint persistence (every 2s during upload + guaranteed flush on
+   exit/interrupt) to eliminate lock contention at high concurrency.
+4. Jittered exponential backoff and HTTP 429/503 Retry-After rate-limit handling.
+5. Tuned cross-border defaults (workers=16, chunk_mb=16, pool_maxsize>=32).
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
 import shutil
 import stat
@@ -37,7 +41,9 @@ from tqdm.auto import tqdm
 
 DEFAULT_BASE_URL = "https://pan.sjtu.edu.cn"
 DEFAULT_WORK_DIR = "/content/.jbox_transfer"
-DEFAULT_CHUNK_MB = 4
+DEFAULT_WORKERS = 16
+DEFAULT_CHUNK_MB = 16
+DEFAULT_CHECKPOINT_INTERVAL = 2.0
 DEFAULT_PACK_WORKERS = 12
 DEFAULT_PREFETCH_MB = 128
 PREFETCH_MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -79,6 +85,14 @@ class JboxSessionExpiredError(JboxTransferError):
 
 class JboxSignatureExpiredError(JboxTransferError):
     """Pre-signed COS part upload signature expired (HTTP 403)."""
+
+
+class JboxRateLimitError(JboxTransferError):
+    """COS or SMH rate limit / transient throttling response (HTTP 429/503)."""
+
+    def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 def normalize_remote_path(path: str) -> str:
@@ -254,6 +268,7 @@ class JboxClient:
         base_url: str = DEFAULT_BASE_URL,
         cos_scheme: str = "https",
         timeout: tuple[int, int] = (20, 60),
+        pool_maxsize: int = 32,
     ) -> None:
         token = clean_credential(user_token, prefixes=("UserToken=",))
         if not token:
@@ -262,6 +277,7 @@ class JboxClient:
         self.base_url = base_url.rstrip("/")
         self.cos_scheme = cos_scheme
         self.timeout = timeout
+        self._pool_maxsize = max(16, int(pool_maxsize))
         self._local = threading.local()
         self._cred_lock = threading.Lock()
         self._dir_lock = threading.Lock()
@@ -274,7 +290,10 @@ class JboxClient:
         sess = getattr(self._local, "session", None)
         if sess is None:
             sess = requests.Session()
-            adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+            adapter = HTTPAdapter(
+                pool_connections=self._pool_maxsize,
+                pool_maxsize=self._pool_maxsize,
+            )
             sess.mount("https://", adapter)
             sess.mount("http://", adapter)
             self._local.session = sess
@@ -545,6 +564,18 @@ class JboxClient:
 
         if res.status_code == 403:
             raise JboxSignatureExpiredError(f"分片 {part_number} 签名过期或被拒 (HTTP 403)")
+        if res.status_code in (429, 503):
+            retry_after: Optional[float] = None
+            raw_ra = (res.headers.get("Retry-After") or "").strip()
+            if raw_ra:
+                try:
+                    retry_after = max(0.5, min(60.0, float(raw_ra)))
+                except ValueError:
+                    retry_after = None
+            raise JboxRateLimitError(
+                f"分片 {part_number} 触发限流/繁忙 (HTTP {res.status_code})",
+                retry_after=retry_after,
+            )
         if not res.ok:
             raise JboxTransferError(
                 f"分片 {part_number} 上传至 COS 失败 (HTTP {res.status_code}): {(res.text or '')[:200]}"
@@ -641,11 +672,12 @@ class ResumableUploader:
         client: JboxClient,
         work_dir: str = DEFAULT_WORK_DIR,
         chunk_mb: int = DEFAULT_CHUNK_MB,
-        workers: int = 4,
+        workers: int = DEFAULT_WORKERS,
         conflict: str = "overwrite",
         force_upload: bool = False,
         max_retries: int = 5,
         chunk_bytes: Optional[int] = None,
+        checkpoint_interval: float = DEFAULT_CHECKPOINT_INTERVAL,
     ) -> None:
         self.client = client
         self.work_dir = work_dir
@@ -656,6 +688,7 @@ class ResumableUploader:
         self.conflict = conflict
         self.force_upload = force_upload
         self.max_retries = max(1, int(max_retries))
+        self.checkpoint_interval = max(0.0, float(checkpoint_interval))
 
     def _checkpoint_path(self, remote_path: str) -> str:
         norm = normalize_remote_path(remote_path)
@@ -865,33 +898,35 @@ class ResumableUploader:
             else:
                 self._remove_checkpoint(ckpt_path)
 
+        class _UploadStopped(Exception):
+            """Internal sentinel raised when another worker or background presign aborts."""
+
         for session_attempt in range(2):
             remaining = [p for p in range(1, chunk_count + 1) if p not in completed_parts]
-            waves = [
-                remaining[i : i + MAX_PARTS_PER_WAVE]
-                for i in range(0, len(remaining), MAX_PARTS_PER_WAVE)
-            ]
-            done_bytes = sum(expected_part_size(file_size, chunk_size, p) for p in completed_parts)
-
-            ctx_lock = threading.Lock()
-            state_lock = threading.Lock()
-            upload_ctx: dict[str, Any] = {}
-            fd = os.open(abs_local, os.O_RDONLY)
-            pbar = tqdm(
-                total=file_size,
-                initial=done_bytes,
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
-                desc=f"⬆️ {display_name}",
-            )
-
             restart_requested = False
-            try:
-                for wave_parts in waves:
-                    if confirm_key is None:
-                        upload_ctx = self.client.start_multipart(norm_remote, wave_parts)
-                        confirm_key = str(upload_ctx["confirmKey"])
+
+            if remaining:
+                done_bytes = sum(expected_part_size(file_size, chunk_size, p) for p in completed_parts)
+                ctx_lock = threading.Lock()
+                ctx_cond = threading.Condition(ctx_lock)
+                state_lock = threading.Lock()
+                ckpt_write_lock = threading.Lock()
+                stop_event = threading.Event()
+                checkpoint_dirty = False
+                last_ckpt_flush = time.monotonic()
+
+                def _flush_checkpoint(force: bool = False) -> None:
+                    nonlocal checkpoint_dirty, last_ckpt_flush
+                    with state_lock:
+                        if confirm_key is None or not checkpoint_dirty:
+                            return
+                        now = time.monotonic()
+                        if not force and (now - last_ckpt_flush) < self.checkpoint_interval:
+                            return
+                        parts_snapshot = set(completed_parts)
+                        checkpoint_dirty = False
+                        last_ckpt_flush = now
+                    with ckpt_write_lock:
                         self._save_checkpoint(
                             ckpt_path,
                             abs_local,
@@ -901,129 +936,323 @@ class ResumableUploader:
                             chunk_size,
                             chunk_count,
                             confirm_key,
-                            completed_parts,
+                            parts_snapshot,
                         )
+
+                pending_parts: deque[int] = deque(remaining)
+                unsigned_queue: deque[int] = deque(remaining)
+                first_batch = [
+                    unsigned_queue.popleft()
+                    for _ in range(min(MAX_PARTS_PER_WAVE, len(unsigned_queue)))
+                ]
+
+                fd = os.open(abs_local, os.O_RDONLY)
+                pbar = tqdm(
+                    total=file_size,
+                    initial=done_bytes,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    desc=f"⬆️ {display_name}",
+                )
+
+                try:
+                    if confirm_key is None:
+                        init_ctx = self.client.start_multipart(norm_remote, first_batch)
+                        confirm_key = str(init_ctx["confirmKey"])
+                        with ckpt_write_lock:
+                            self._save_checkpoint(
+                                ckpt_path,
+                                abs_local,
+                                norm_remote,
+                                file_size,
+                                file_mtime_ns,
+                                chunk_size,
+                                chunk_count,
+                                confirm_key,
+                                set(completed_parts),
+                            )
                     else:
                         try:
-                            upload_ctx = self.client.renew_multipart(confirm_key, wave_parts)
+                            init_ctx = self.client.renew_multipart(confirm_key, first_batch)
                         except JboxSessionExpiredError:
                             if session_attempt == 0:
                                 restart_requested = True
-                                break
-                            raise
-
-                    def _ensure_valid_ctx(
-                        part_num: int,
-                        *,
-                        force: bool = False,
-                        prev_ctx: Optional[dict[str, Any]] = None,
-                        current_wave: list[int] = wave_parts,
-                    ) -> dict[str, Any]:
-                        nonlocal upload_ctx
-                        with ctx_lock:
-                            if (
-                                force
-                                and prev_ctx is not None
-                                and upload_ctx is not prev_ctx
-                                and str(part_num) in (upload_ctx.get("parts") or {})
-                                and not self._is_ctx_expiring(upload_ctx)
-                            ):
-                                return upload_ctx
-
-                            need_renew = (
-                                force
-                                or not upload_ctx
-                                or self._is_ctx_expiring(upload_ctx)
-                                or str(part_num) not in (upload_ctx.get("parts") or {})
-                            )
-                            if need_renew:
-                                with state_lock:
-                                    uncompleted = [
-                                        p for p in current_wave if p not in completed_parts
-                                    ]
-                                if part_num not in uncompleted:
-                                    uncompleted.insert(0, part_num)
-                                assert confirm_key is not None
-                                upload_ctx = self.client.renew_multipart(
-                                    confirm_key, uncompleted[:MAX_PARTS_PER_WAVE]
-                                )
-                            return upload_ctx
-
-                    def _upload_one_part(part_num: int) -> None:
-                        offset = (part_num - 1) * chunk_size
-                        part_len = expected_part_size(file_size, chunk_size, part_num)
-                        data = pread_exact(fd, offset, part_len)
-
-                        last_exc: Optional[Exception] = None
-                        prev_ctx: Optional[dict[str, Any]] = None
-                        for attempt in range(self.max_retries + 1):
-                            force_refresh = isinstance(last_exc, JboxSignatureExpiredError)
-                            ctx = _ensure_valid_ctx(
-                                part_num,
-                                force=force_refresh,
-                                prev_ctx=prev_ctx if force_refresh else None,
-                            )
-                            prev_ctx = ctx
-                            try:
-                                self.client.upload_part(ctx, part_num, data)
-                                with state_lock:
-                                    completed_parts.add(part_num)
-                                    pbar.update(part_len)
-                                    assert confirm_key is not None
-                                    self._save_checkpoint(
-                                        ckpt_path,
-                                        abs_local,
-                                        norm_remote,
-                                        file_size,
-                                        file_mtime_ns,
-                                        chunk_size,
-                                        chunk_count,
-                                        confirm_key,
-                                        completed_parts,
-                                    )
-                                return
-                            except JboxSessionExpiredError:
+                                init_ctx = {}
+                            else:
                                 raise
-                            except (JboxSignatureExpiredError, JboxTransferError, requests.RequestException) as exc:
-                                last_exc = exc
-                                if attempt >= self.max_retries:
-                                    raise
-                                time.sleep(min(2 ** attempt, 30))
 
-                    max_w = min(self.workers, len(wave_parts))
-                    with ThreadPoolExecutor(max_workers=max_w) as pool:
-                        futures = [pool.submit(_upload_one_part, p) for p in wave_parts]
-                        try:
-                            for fut in as_completed(futures):
-                                fut.result()
-                        except JboxSessionExpiredError:
-                            for f in futures:
-                                f.cancel()
-                            if session_attempt == 0:
-                                restart_requested = True
-                                break
-                            raise
-                        except Exception:
-                            for f in futures:
-                                f.cancel()
-                            raise
+                    if not restart_requested:
+                        signed_parts: dict[int, dict[str, Any]] = {p: init_ctx for p in first_batch}
+                        signed_count = len(first_batch)
+                        dispatched_count = 0
+                        sign_in_progress = False
+                        bg_session_expired: Optional[JboxSessionExpiredError] = None
+                        max_w = min(self.workers, len(remaining))
+                        prefetch_threshold = min(
+                            MAX_PARTS_PER_WAVE - 1, max(max_w, MAX_PARTS_PER_WAVE // 2)
+                        )
 
-                    if restart_requested:
-                        break
-            except KeyboardInterrupt:
-                print(
-                    f"\n⚠️ 上传已中断。断点文件已保留在 {ckpt_path}，重新运行即可自动续传。"
-                )
-                raise
-            except Exception:
-                if not restart_requested:
+                        with ThreadPoolExecutor(max_workers=1) as sign_pool:
+
+                            def _bg_renew(batch: list[int]) -> None:
+                                nonlocal signed_count, sign_in_progress, bg_session_expired
+                                if stop_event.is_set():
+                                    with ctx_lock:
+                                        unsigned_queue.extendleft(reversed(batch))
+                                        sign_in_progress = False
+                                        ctx_cond.notify_all()
+                                    return
+                                try:
+                                    assert confirm_key is not None
+                                    new_ctx = self.client.renew_multipart(confirm_key, batch)
+                                except JboxSessionExpiredError as exc:
+                                    with ctx_lock:
+                                        bg_session_expired = exc
+                                        stop_event.set()
+                                        sign_in_progress = False
+                                        ctx_cond.notify_all()
+                                    return
+                                except Exception:
+                                    with ctx_lock:
+                                        unsigned_queue.extendleft(reversed(batch))
+                                        sign_in_progress = False
+                                        ctx_cond.notify_all()
+                                    return
+
+                                with ctx_lock:
+                                    for p in batch:
+                                        signed_parts[p] = new_ctx
+                                    signed_count += len(batch)
+                                    sign_in_progress = False
+                                    ctx_cond.notify_all()
+
+                            def _maybe_schedule_prefetch_locked() -> None:
+                                nonlocal sign_in_progress
+                                if (
+                                    not stop_event.is_set()
+                                    and not sign_in_progress
+                                    and unsigned_queue
+                                    and (signed_count - dispatched_count) <= prefetch_threshold
+                                ):
+                                    batch = [
+                                        unsigned_queue.popleft()
+                                        for _ in range(min(MAX_PARTS_PER_WAVE, len(unsigned_queue)))
+                                    ]
+                                    sign_in_progress = True
+                                    sign_pool.submit(_bg_renew, batch)
+
+                            def _get_part_ctx(
+                                part_num: int,
+                                *,
+                                force: bool = False,
+                                prev_ctx: Optional[dict[str, Any]] = None,
+                            ) -> dict[str, Any]:
+                                nonlocal signed_count, sign_in_progress
+                                while True:
+                                    with ctx_cond:
+                                        if stop_event.is_set():
+                                            if bg_session_expired is not None:
+                                                raise bg_session_expired
+                                            raise _UploadStopped()
+
+                                        cur = signed_parts.get(part_num)
+                                        if cur is not None:
+                                            if (
+                                                force
+                                                and prev_ctx is not None
+                                                and cur is not prev_ctx
+                                                and not self._is_ctx_expiring(cur)
+                                            ):
+                                                return cur
+                                            if not force and not self._is_ctx_expiring(cur):
+                                                return cur
+
+                                        if sign_in_progress:
+                                            ctx_cond.wait(timeout=0.5)
+                                            continue
+
+                                        sign_in_progress = True
+                                        renew_batch: list[int] = [part_num]
+                                        popped_from_unsigned: list[int] = []
+                                        if part_num in unsigned_queue:
+                                            unsigned_queue.remove(part_num)
+                                            popped_from_unsigned.append(part_num)
+                                            while (
+                                                unsigned_queue
+                                                and len(renew_batch) < MAX_PARTS_PER_WAVE
+                                            ):
+                                                nxt = unsigned_queue.popleft()
+                                                renew_batch.append(nxt)
+                                                popped_from_unsigned.append(nxt)
+                                        else:
+                                            for p, pctx in list(signed_parts.items()):
+                                                if len(renew_batch) >= MAX_PARTS_PER_WAVE:
+                                                    break
+                                                if p != part_num and (
+                                                    pctx is prev_ctx or self._is_ctx_expiring(pctx)
+                                                ):
+                                                    renew_batch.append(p)
+
+                                    try:
+                                        assert confirm_key is not None
+                                        new_ctx = self.client.renew_multipart(
+                                            confirm_key, renew_batch
+                                        )
+                                    except Exception:
+                                        with ctx_lock:
+                                            if popped_from_unsigned:
+                                                unsigned_queue.extendleft(
+                                                    reversed(popped_from_unsigned)
+                                                )
+                                            sign_in_progress = False
+                                            ctx_cond.notify_all()
+                                        raise
+
+                                    with ctx_lock:
+                                        for p in renew_batch:
+                                            signed_parts[p] = new_ctx
+                                        signed_count += len(popped_from_unsigned)
+                                        sign_in_progress = False
+                                        ctx_cond.notify_all()
+                                    return new_ctx
+
+                            def _worker_loop() -> None:
+                                nonlocal dispatched_count, checkpoint_dirty
+                                while not stop_event.is_set():
+                                    with ctx_lock:
+                                        if not pending_parts or stop_event.is_set():
+                                            return
+                                        part_num = pending_parts.popleft()
+                                        dispatched_count += 1
+                                        _maybe_schedule_prefetch_locked()
+
+                                    offset = (part_num - 1) * chunk_size
+                                    part_len = expected_part_size(file_size, chunk_size, part_num)
+                                    data = pread_exact(fd, offset, part_len)
+
+                                    last_exc: Optional[Exception] = None
+                                    prev_ctx: Optional[dict[str, Any]] = None
+                                    for attempt in range(self.max_retries + 1):
+                                        if stop_event.is_set():
+                                            if bg_session_expired is not None:
+                                                raise bg_session_expired
+                                            raise _UploadStopped()
+
+                                        force_refresh = isinstance(
+                                            last_exc, JboxSignatureExpiredError
+                                        )
+                                        ctx = _get_part_ctx(
+                                            part_num,
+                                            force=force_refresh,
+                                            prev_ctx=prev_ctx if force_refresh else None,
+                                        )
+                                        prev_ctx = ctx
+                                        try:
+                                            self.client.upload_part(ctx, part_num, data)
+                                            with state_lock:
+                                                completed_parts.add(part_num)
+                                                pbar.update(part_len)
+                                                checkpoint_dirty = True
+                                            with ctx_lock:
+                                                signed_parts.pop(part_num, None)
+                                            _flush_checkpoint(force=False)
+                                            break
+                                        except JboxSessionExpiredError:
+                                            stop_event.set()
+                                            with ctx_lock:
+                                                ctx_cond.notify_all()
+                                            raise
+                                        except (
+                                            JboxSignatureExpiredError,
+                                            JboxRateLimitError,
+                                            JboxTransferError,
+                                            requests.RequestException,
+                                        ) as exc:
+                                            last_exc = exc
+                                            if attempt >= self.max_retries:
+                                                stop_event.set()
+                                                with ctx_lock:
+                                                    ctx_cond.notify_all()
+                                                raise
+                                            if (
+                                                isinstance(exc, JboxRateLimitError)
+                                                and exc.retry_after is not None
+                                            ):
+                                                delay = exc.retry_after * random.uniform(0.9, 1.2)
+                                            else:
+                                                delay = min(2 ** attempt, 30) * random.uniform(
+                                                    0.75, 1.25
+                                                )
+                                            if stop_event.wait(delay):
+                                                if bg_session_expired is not None:
+                                                    raise bg_session_expired
+                                                raise _UploadStopped()
+
+                            with ThreadPoolExecutor(max_workers=max_w) as worker_pool:
+                                futures = [worker_pool.submit(_worker_loop) for _ in range(max_w)]
+                                first_fatal: Optional[BaseException] = None
+                                session_exc: Optional[JboxSessionExpiredError] = None
+                                try:
+                                    for fut in as_completed(futures):
+                                        try:
+                                            fut.result()
+                                        except _UploadStopped:
+                                            pass
+                                        except JboxSessionExpiredError as exc:
+                                            if session_exc is None:
+                                                session_exc = exc
+                                            stop_event.set()
+                                            with ctx_lock:
+                                                ctx_cond.notify_all()
+                                        except BaseException as exc:
+                                            if first_fatal is None:
+                                                first_fatal = exc
+                                            stop_event.set()
+                                            with ctx_lock:
+                                                ctx_cond.notify_all()
+                                except BaseException as exc:
+                                    stop_event.set()
+                                    with ctx_lock:
+                                        ctx_cond.notify_all()
+                                    if first_fatal is None:
+                                        first_fatal = exc
+
+                                if bg_session_expired is not None and session_exc is None:
+                                    session_exc = bg_session_expired
+
+                                if session_exc is not None:
+                                    if session_attempt == 0:
+                                        restart_requested = True
+                                    else:
+                                        raise session_exc
+                                elif first_fatal is not None:
+                                    raise first_fatal
+                except KeyboardInterrupt:
+                    stop_event.set()
+                    with ctx_lock:
+                        ctx_cond.notify_all()
+                    _flush_checkpoint(force=True)
                     print(
-                        f"\n💡 断点进度已保留在 {ckpt_path}，修复问题后重新运行即可自动续传。"
+                        f"\n⚠️ 上传已中断。断点文件已保留在 {ckpt_path}，重新运行即可自动续传。"
                     )
-                raise
-            finally:
-                pbar.close()
-                os.close(fd)
+                    raise
+                except Exception:
+                    stop_event.set()
+                    with ctx_lock:
+                        ctx_cond.notify_all()
+                    if not restart_requested:
+                        _flush_checkpoint(force=True)
+                        print(
+                            f"\n💡 断点进度已保留在 {ckpt_path}，修复问题后重新运行即可自动续传。"
+                        )
+                    raise
+                finally:
+                    stop_event.set()
+                    if not restart_requested and confirm_key is not None:
+                        _flush_checkpoint(force=True)
+                    pbar.close()
+                    os.close(fd)
 
             if restart_requested:
                 print("⚠️ 云端上传会话已过期，正在清理旧断点并重新初始化上传...")
@@ -1444,30 +1673,35 @@ def run_speedtest(
     client: JboxClient,
     remote_dir: str,
     work_dir: str = DEFAULT_WORK_DIR,
-    workers: int = 1,
+    workers: int = DEFAULT_WORKERS,
+    chunk_mb: int = 4,
+    size_mb: int = 16,
 ) -> float:
-    """Upload a 10 MiB temporary random file to measure upload throughput, then clean up."""
-    size_bytes = 10 * 1024 * 1024
+    """Upload a temporary random file with concurrent workers to measure throughput, then clean up."""
+    test_mb = max(4, int(size_mb))
+    test_chunk_mb = max(1, int(chunk_mb))
+    test_workers = max(1, int(workers))
+    size_bytes = test_mb * 1024 * 1024
     os.makedirs(work_dir, exist_ok=True)
     local_tmp = os.path.join(work_dir, f".jbox_speedtest_{os.getpid()}.bin")
     remote_tmp = join_remote_path(remote_dir, f".jbox_speedtest_{os.getpid()}_{int(time.time())}.bin")
-    print("⏱️ 正在进行 10 MiB 上传测速...")
+    print(f"⏱️ 正在进行 {test_mb} MiB 上传测速 (并发={test_workers})...")
     try:
         with open(local_tmp, "wb") as f:
             f.write(os.urandom(size_bytes))
         uploader = ResumableUploader(
             client,
             work_dir=work_dir,
-            chunk_mb=4,
-            workers=workers,
+            chunk_mb=test_chunk_mb,
+            workers=test_workers,
             conflict="overwrite",
             force_upload=True,
         )
         t0 = time.monotonic()
-        uploader.upload_file(local_tmp, remote_tmp, label="10MiB 测速")
+        uploader.upload_file(local_tmp, remote_tmp, label=f"{test_mb}MiB 测速")
         dt = max(time.monotonic() - t0, 1e-6)
-        mbps = 10.0 / dt
-        print(f"✅ 10 MiB 测速完成：耗时 {dt:.2f}s，速率 {mbps:.2f} MiB/s")
+        mbps = float(test_mb) / dt
+        print(f"✅ {test_mb} MiB 测速完成 (并发={test_workers})：耗时 {dt:.2f}s，速率 {mbps:.2f} MiB/s")
         return mbps
     finally:
         if os.path.exists(local_tmp):
@@ -1632,7 +1866,7 @@ def transfer(
     archive_format: str = "zip",
     auth_mode: str = "UserToken",
     credential: Optional[str] = None,
-    workers: int = 4,
+    workers: int = DEFAULT_WORKERS,
     chunk_mb: int = DEFAULT_CHUNK_MB,
     conflict: str = "overwrite",
     work_dir: str = DEFAULT_WORK_DIR,
@@ -1699,7 +1933,12 @@ def transfer(
         if norm_auth == "JAAuthCookie"
         else cred_val
     )
-    client = JboxClient(user_token, base_url=base_url, cos_scheme=cos_scheme)
+    client = JboxClient(
+        user_token,
+        base_url=base_url,
+        cos_scheme=cos_scheme,
+        pool_maxsize=max(32, int(workers) + 4),
+    )
 
     print("🔗 正在验证交大云盘登录与空间配额...")
     client.get_space_cred()
@@ -1721,7 +1960,7 @@ def transfer(
         client.ensure_dir(rdir)
 
     if speedtest:
-        run_speedtest(client, norm_remote_dir, work_dir=work_dir, workers=1)
+        run_speedtest(client, norm_remote_dir, work_dir=work_dir, workers=int(workers))
 
     uploader = ResumableUploader(
         client=client,
@@ -1838,9 +2077,9 @@ def transfer(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Create CLI argument parser for gdrive_to_jbox_v2."""
+    """Create CLI argument parser for gdrive_to_jbox (v3)."""
     parser = argparse.ArgumentParser(
-        description="Google Drive (Colab mount) -> SJTU Jbox (pan.sjtu.edu.cn) 并发预读打包 + 原生分片断点续传工具 (v2)"
+        description="Google Drive (Colab mount) -> SJTU Jbox (pan.sjtu.edu.cn) 并发预读打包 + 滑动窗口高速分片断点续传工具 (v3)"
     )
     parser.add_argument("--src", required=True, help="本地或 Google Drive 源路径（文件或目录）")
     parser.add_argument("--remote-dir", default="/colab_transfer", help="交大云盘目标目录 (默认: /colab_transfer)")
@@ -1864,8 +2103,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--token", default=None, help="直接传入 UserToken（也可通过 JBOX_USER_TOKEN 环境变量）")
     parser.add_argument("--ja-cookie", default=None, help="直接传入 JAAuthCookie（也可通过 JBOX_JA_COOKIE 环境变量）")
-    parser.add_argument("--workers", type=int, default=4, help="并发上传分片线程数 (默认: 4)")
-    parser.add_argument("--chunk-mb", type=int, default=DEFAULT_CHUNK_MB, help="分片大小 MiB (默认: 4)")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"并发上传分片线程数 (默认: {DEFAULT_WORKERS})",
+    )
+    parser.add_argument(
+        "--chunk-mb",
+        type=int,
+        default=DEFAULT_CHUNK_MB,
+        help=f"分片大小 MiB (默认: {DEFAULT_CHUNK_MB})",
+    )
     parser.add_argument(
         "--pack-workers",
         type=int,

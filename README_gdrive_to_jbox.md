@@ -2,15 +2,20 @@
 
 面向 **Google Drive ──(Colab 挂载)──▶ 上海交通大学云盘（Jbox / `pan.sjtu.edu.cn`）** 工作环境的通用传输脚本与配套 Notebook。
 
-直接对接交大云盘底层（腾讯云 SMH + COS）原生分片上传接口，**不再依赖 `TboxWebdav` 或 `rclone`**，实现「**云端整包单文件下载 + 本地 4 MiB 级分片断点续传**」。
+直接对接交大云盘底层（腾讯云 SMH + COS）原生分片上传接口，**不再依赖 `TboxWebdav` 或 `rclone`**，实现「**云端整包单文件下载 + 本地可配置分片高速断点续传**」。
 
 ---
 
 ## 核心特性
 
 - **零额外中间组件**：仅依赖 Colab 预装 Python 环境（`requests`、`tqdm` + 标准库），无需下载、解压或常驻 `.NET` / WebDAV 代理进程。
+- **高吞吐跨国上传引擎（v3）**：
+  - **持久化线程池 + HTTPS 长连接复用**：单文件上传全程复用同一个工作线程池与线程本地 `requests.Session` 连接池（`pool_maxsize >= 32`），消除每 50 个分片重建线程池与重走 TLS 握手的“波次屏障”；
+  - **滑动窗口后台预签分片**：在当前批次分片上传期间，后台线程自动提前向服务端 `renew_multipart` 续签下一批 50 片，工作线程零等待连续推流；
+  - **并发读取打包 + 节流断点落盘**：12 线程并发预读 Drive 文件并按 `128 MiB` 有界缓冲打包，上传时每 `2 秒` 节流持久化断点并在退出/中断时强制刷盘，兼顾高并发性能与断点可靠性；
+  - **抖动退避与限流自适应**：支持指数退避随机抖动，遇到 HTTP `429` / `503` 时自动按 `Retry-After` 等待后重试。
 - **整包落盘，同时保留断点续传**：
-  - 本地无压缩打包后，通过交大云盘原生 Multipart API（`confirmKey` + 每批最多 50 片轮询续签）并发上传，服务端合并为**单个完整归档文件**；
+  - 本地无压缩打包后，通过交大云盘原生 Multipart API（`confirmKey` + 滑动窗口每批最多 50 片预签）并发上传，服务端合并为**单个完整归档文件**；
   - 网页端/客户端可直接单文件高速下载，本地直接解压，无需再下载分卷并手工 `cat` 合并。
 - **可靠校验与自动恢复**：
   - 每个分片上传直连 COS 并校验返回 `ETag`（32 位 hex 时比对本地分片 MD5）；
@@ -66,11 +71,11 @@
    - `REMOTE_DIR`：交大云盘目标目录（默认 `/colab_transfer`）
    - `PACK_MODE`：`single` / `subdir` / `direct`
    - `ARCHIVE_FORMAT`：`zip`（推荐）或 `tar`
-   - `WORKERS`：并发上传分片线程数（`1`~`8`，默认 `4`）
-   - `CHUNK_MB`：分片大小 MiB（`4` / `8` / `16`，默认 `4`）
+   - `WORKERS`：并发上传分片线程数（`1`~`32`，默认 `16`）
+   - `CHUNK_MB`：分片大小 MiB（`4` / `8` / `16` / `32`，默认 `16`）
    - `CONFLICT`：远端同名文件处理策略（`overwrite` / `rename` / `ask`）
    - `SCRIPT_PATH`：`gdrive_to_jbox.py` 路径
-3. **`2. 一键打包并断点续传至交大云盘 (pan.sjtu.edu.cn)`**：选择 `AUTH_MODE`（`UserToken` / `JAAuthCookie`）及可选开关（`RUN_SPEEDTEST`、`FORCE_REPACK`、`FORCE_UPLOAD`、`KEEP_TEMP`、`DRY_RUN`），运行后按提示粘贴凭证并回车。
+3. **`2. 一键打包并断点续传至交大云盘 (pan.sjtu.edu.cn)`**：选择 `AUTH_MODE`（`UserToken` / `JAAuthCookie`）及可选开关（`RUN_SPEEDTEST` 默认关闭、`FORCE_REPACK`、`FORCE_UPLOAD`、`KEEP_TEMP`、`DRY_RUN`），运行后按提示粘贴凭证并回车。
 
 ### 方式二：命令行（CLI）直接运行
 
@@ -123,8 +128,8 @@ result = mod.transfer(
     pack_mode="single",        # "single" | "subdir" | "direct"
     archive_format="zip",      # "zip" | "tar"
     auth_mode="UserToken",     # "UserToken" | "JAAuthCookie"
-    workers=4,
-    chunk_mb=4,
+    workers=16,
+    chunk_mb=16,
     conflict="overwrite",      # "overwrite" | "rename" | "ask"
     speedtest=False,
     dry_run=False,
@@ -159,14 +164,17 @@ print(result)
 | `--auth-mode` | `UserToken` | 认证方式：`UserToken` / `JAAuthCookie` |
 | `--token` | `None` | 直接传入 `UserToken`（也支持环境变量 `JBOX_USER_TOKEN`） |
 | `--ja-cookie` | `None` | 直接传入 `JAAuthCookie`（也支持环境变量 `JBOX_JA_COOKIE`；仅传此项时自动切换为 `JAAuthCookie` 模式） |
-| `--workers` | `4` | 并发上传分片线程数 |
-| `--chunk-mb` | `4` | 分片大小（MiB）；单文件分片若超过 `10000` 个，会自动按 `4 MiB` 步进增大分片尺寸 |
+| `--workers` | `16` | 并发上传分片线程数 |
+| `--chunk-mb` | `16` | 分片大小（MiB）；单文件分片若超过 `10000` 个，会自动按 `4 MiB` 步进增大分片尺寸 |
+| `--pack-workers` | `12` | 打包阶段并发从 Drive 预读文件的线程数 |
+| `--prefetch-mb` | `128` | 打包预读内存缓冲上限（MiB） |
+| `--no-pipeline` | `False` | 关闭 `subdir` 模式下「边上传边后台打包下一子目录」流水线 |
 | `--conflict` | `overwrite` | 远端同名冲突策略：`overwrite`（覆盖）/ `rename`（自动重命名）/ `ask`（冲突报错） |
 | `--work-dir` | `/content/.jbox_transfer` | 本地临时归档与断点元数据目录 |
 | `--force-repack` | `False` | 忽略本地已缓存的归档，强制重新打包 |
 | `--force-upload` | `False` | 忽略远端「同名同大小跳过」检查，强制重新上传 |
 | `--keep-temp` | `False` | 上传并校验完成后保留本地临时归档文件 |
-| `--speedtest` | `False` | 正式传输前先上传并清理一个 10 MiB 随机文件以测试速率 |
+| `--speedtest` | `False` | 正式传输前先使用当前 `--workers` 上传并清理一个 16 MiB 随机文件以测试并发速率 |
 | `--dry-run` | `False` | 仅扫描源目录并输出目标路径与预计体积，不要求凭证也不上传 |
 
 ---
@@ -204,3 +212,7 @@ print(result)
 **Q4：提示交大云盘空间配额不足或上传中途报会话过期？**
 - 登录校验阶段会立即对比 `availableSpace` 与预计上传体积，配额不足会提前中止，避免白跑打包。
 - 若断点暂停时间过久导致云端 `confirmKey` 失效，脚本会捕获会话过期错误并自动清理旧断点、从第 1 片重新建立会话上传，无需人工干预删除文件。
+
+**Q5：跨国上传如何进一步提速？从旧版本断点续传需要注意什么？**
+- 从美国 Colab 机房往国内 COS 上传时单连接 RTT 较高，适当提高并发与分片大小可显著拉升吞吐：推荐 `WORKERS = 16~24`、`CHUNK_MB = 16`（或 `32`），可关闭 `RUN_SPEEDTEST` 节省测速时间；若出现明显 429 限流或重传，可适当回调到 `WORKERS = 12~16`。
+- **断点兼容性提示**：若某个文件在旧版（如 `CHUNK_MB = 4`）时传到一半中断、希望接续上次进度，请保持相同的 `CHUNK_MB` 与 `REMOTE_DIR` 跑完该文件（可单独提高 `WORKERS` 加速剩余分片）；若修改 `CHUNK_MB`，分片布局会变化，脚本会按新分片从头上传。

@@ -28,3 +28,4 @@ REMOTE_DIR = "/colab_transfer" #@param {type:"string"}
 ---
 
 > 2026.11.22 py更新为v2。修改了py打包逻辑为多线程，提升打包速率
+> 2026.11.28 py更新为v3：优化跨国高延迟上传吞吐（持久化线程池复用 HTTPS 长连接、滑动窗口后台预签分片、节流断点落盘、默认并发 16 / 分片 16 MiB），并同步更新 `colab_transfer.ipynb`
